@@ -1,5 +1,7 @@
 from dowhy import CausalModel
 import numpy as np
+from handle_missing_values import *
+from handle_outliers import *
 # everything here is specific for Stack Overflow
 
 
@@ -102,6 +104,37 @@ def bin_ethnicity(df):
     return df
 
 
+def bin_education(df):
+    edlevel_bins = {
+        'Primary/elementary school': 'Primary',
+        'Secondary school': 'Secondary',
+        'Bachelor’s degree': 'BSc',
+        'Associate degree (A.A., A.S., etc.)': 'BSc',
+        'Master’s degree': 'MSc',
+        'Other doctoral degree (Ph.D., Ed.D., etc.)': 'PhD',
+        'Professional degree (JD, MD, etc.)': 'PhD',
+        'Some college/university study without earning a degree': 'Other',
+        'Something else': 'Other'
+    }
+    df['EdLevel'] = df['EdLevel'].map(edlevel_bins)
+    return df
+
+
+def encode_edlevel(df):
+    df = bin_education(df)
+    edlevel_map = {
+        'Primary': 0,
+        'Secondary': 1,
+        'BSc': 2,
+        'MSc': 3,
+        'PhD': 4,
+        'Other': np.nan
+    }
+    if 'EdLevel' in df.columns:
+        df['EdLevel'] = df['EdLevel'].map(edlevel_map)
+    return df
+
+
 def encode_age(df):
     age_map = {
         'Under 18 years old': 0,
@@ -197,8 +230,6 @@ def encode_demographics(df):
 
 def calculate_ate(df, treatment, outcome, confounders,
                   method='backdoor.propensity_score_matching'):
-
-    # initiate model
     model = CausalModel(
         data=df,
         treatment=treatment,
@@ -212,7 +243,80 @@ def calculate_ate(df, treatment, outcome, confounders,
         identified_estimand,
         method_name=method
     )
-
-    print("Estimated ATE:", estimate.value)
-
+    print(estimate.value)
     return estimate.value
+
+
+def bootstrap_ate(df, treatment_col, outcome_col, confounders, n_bootstrap=1000, confidence_level=0.95,
+                  model_builder=calculate_ate):
+    bootstrap_ates = []
+
+    for _ in range(n_bootstrap):
+        # 1. Resample with replacement
+        bootstrap_sample = df.sample(frac=1, replace=True)
+
+        # 2. Recalculate ATE
+        ate = model_builder(bootstrap_sample, treatment_col, outcome_col, confounders)
+        bootstrap_ates.append(ate)
+
+    # 3. Calculate confidence interval
+    lower_percentile = (1 - confidence_level) / 2 * 100
+    upper_percentile = (1 + confidence_level) / 2 * 100
+
+    lower_bound = np.percentile(bootstrap_ates, lower_percentile)
+    upper_bound = np.percentile(bootstrap_ates, upper_percentile)
+
+    # 4. Statistical significance
+    significance = "Yes" if (lower_bound > 0 or upper_bound < 0) else "No"
+    print("lower bound:", lower_bound, "upper bound:", upper_bound, "significance:", significance)
+
+    return (lower_bound, upper_bound), significance, bootstrap_ates
+
+
+def run_all_together(df, treatment, outcome, cofounders, missing_values_method, outlier_method):
+    df_copy = df.copy()
+
+    # handle missing values
+    if missing_values_method == "dropna":
+        df_copy = df_copy.dropna()
+    elif missing_values_method == "mean":
+        df_copy = impute_attribute(df_copy, outcome, 'mean')
+        df_copy = impute_attribute(df_copy, treatment, 'mode')
+    elif missing_values_method == "median":
+        df_copy = impute_attribute(df_copy, outcome, 'median')
+        df_copy = impute_attribute(df_copy, treatment, 'mode')
+    elif missing_values_method == "fancy":
+        df_copy = encode_demographics(df_copy)
+        df_copy = encode_edlevel(df_copy)
+        df_copy = iterative_impute(df_copy, outcome,  cofounders)
+        df_copy = iterative_impute(df_copy, treatment, cofounders)
+        df_copy[treatment] = df_copy[treatment].apply(lambda x: 1 if x >= 2 else 0)
+
+    # handle outliers
+    if outlier_method == "iqr":
+        df_copy = iqr_removal_method(df_copy, outcome)
+    elif outlier_method == "isolation forest":
+        if missing_values_method == "fancy":
+            df_copy = isolation_forest_detection(df_copy, outcome, cofounders)
+        else:
+            df_copy = encode_demographics(df_copy)
+            df_copy = isolation_forest_detection(df_copy, outcome, cofounders)
+    elif outlier_method == "standard deviation":
+        df_copy = standard_deviation_detection(df_copy, outcome)
+    elif outlier_method == "none":
+        df_copy = df_copy
+
+    # prepare for ate calc
+    if missing_values_method != "fancy":
+        df_copy[treatment] = df_copy[treatment].apply(bin_education_level)
+        df_copy = df_copy[df_copy[treatment].isin(['Low', 'High'])]
+        df_copy[treatment] = df_copy[treatment].map({'Low': 0, 'High': 1})
+        df_copy = df_copy.dropna(subset=[treatment, outcome] + cofounders)
+    elif missing_values_method == "fancy":
+        df_copy = df_copy.dropna(subset=[treatment, outcome] + cofounders)
+
+    print("missing values method:", missing_values_method, "outlier detection method:", outlier_method)
+    # calculations
+    ate = calculate_ate(df_copy, treatment, outcome, cofounders)
+    print("ATE:", ate)
+    ci = bootstrap_ate(df_copy, treatment, outcome, cofounders)
